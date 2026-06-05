@@ -1,0 +1,5 @@
+/zensu-agent
+/bin/
+*.out
+*.test
+.DS_Store

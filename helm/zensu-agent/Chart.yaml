@@ -1,0 +1,14 @@
+apiVersion: v2
+name: zensu-agent
+description: Outbound push/heartbeat agent that reports Kubernetes workload uptime to Zensu
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/MKITConsulting/zensu-agent
+sources:
+  - https://github.com/MKITConsulting/zensu-agent
+keywords:
+  - zensu
+  - monitoring
+  - uptime
+  - kubernetes

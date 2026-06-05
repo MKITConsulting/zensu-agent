@@ -1,0 +1,38 @@
+{{- if eq .Values.agent.mode "cronjob" }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "zensu-agent.fullname" . }}
+  labels:
+    {{- include "zensu-agent.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.agent.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "zensu-agent.selectorLabels" . | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "zensu-agent.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: agent
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args: ["--once"]
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              envFrom:
+                - configMapRef:
+                    name: {{ include "zensu-agent.fullname" . }}
+                - secretRef:
+                    name: {{ include "zensu-agent.secretName" . }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+{{- end }}

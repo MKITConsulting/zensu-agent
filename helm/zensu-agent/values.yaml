@@ -1,0 +1,58 @@
+image:
+  repository: ghcr.io/mkitconsulting/zensu-agent
+  # tag defaults to the chart appVersion when empty
+  tag: ""
+  pullPolicy: IfNotPresent
+
+zensu:
+  # Base URL of the Zensu API, e.g. https://api.zensu.dev (required)
+  apiUrl: ""
+  # The Zensu product UUID this agent reports to (required)
+  productId: ""
+  # API key (zsk_...). Leave empty and set existingSecret to supply it yourself.
+  apiKey: ""
+  # Name of a pre-existing Secret containing key ZENSU_API_KEY. Takes precedence over apiKey.
+  existingSecret: ""
+  # Free-form source label attached to every heartbeat.
+  source: k8s-agent
+
+agent:
+  # deployment = long-running ticker; cronjob = one-shot per schedule (--once)
+  mode: deployment
+  intervalSeconds: 60
+  # Namespaces to scan for annotated workloads. Empty -> "default".
+  namespaces: []
+  # cronjob mode only
+  schedule: "*/1 * * * *"
+
+rbac:
+  # Create the read-only ClusterRole + binding (get/list/watch deployments and pods).
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 64Mi
+  requests:
+    cpu: 10m
+    memory: 32Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint helm/zensu-agent
+      - run: |
+          helm template t helm/zensu-agent \
+            --set zensu.apiUrl=https://api.zensu.dev \
+            --set zensu.productId=00000000-0000-0000-0000-000000000000 \
+            --set zensu.apiKey=zsk_test > /dev/null
