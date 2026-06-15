@@ -9,6 +9,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -18,13 +19,27 @@ func i32(v int32) *int32 { return &v }
 func deployment(ns, name, svcSlug string, ready, desired int32) *appsv1.Deployment {
 	d := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
-		Spec:       appsv1.DeploymentSpec{Replicas: i32(desired)},
-		Status:     appsv1.DeploymentStatus{ReadyReplicas: ready},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: i32(desired),
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: ready},
 	}
 	if svcSlug != "" {
 		d.ObjectMeta.Annotations = map[string]string{AnnotationService: svcSlug}
 	}
 	return d
+}
+
+func pod(ns, name string, lbls map[string]string, restarts ...int32) *corev1.Pod {
+	var cs []corev1.ContainerStatus
+	for _, r := range restarts {
+		cs = append(cs, corev1.ContainerStatus{RestartCount: r})
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Labels: lbls},
+		Status:     corev1.PodStatus{ContainerStatuses: cs},
+	}
 }
 
 func TestDeriveStatus(t *testing.T) {
@@ -68,7 +83,7 @@ func TestCollect_DedupAcrossNamespaces(t *testing.T) {
 	client := fake.NewSimpleClientset(
 		deployment("ns1", "auth-api", "auth", 3, 3),
 		deployment("ns1", "worker", "worker", 1, 2),
-		deployment("ns1", "db", "", 1, 1), // unannotated, ignored
+		deployment("ns1", "db", "", 1, 1),             // unannotated, ignored
 		deployment("ns2", "auth-api-2", "auth", 2, 2), // duplicate slug, deduped
 	)
 	a := New(Config{
@@ -96,6 +111,33 @@ func TestCollect_DedupAcrossNamespaces(t *testing.T) {
 	}
 	if bySlug["auth"].IntervalSeconds != 30 {
 		t.Errorf("interval not propagated: %d", bySlug["auth"].IntervalSeconds)
+	}
+}
+
+func TestCollect_SumsRestartCounts(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		deployment("default", "api", "api", 2, 2),
+		pod("default", "api-1", map[string]string{"app": "api"}, 3),
+		pod("default", "api-2", map[string]string{"app": "api"}, 1, 2),
+		pod("default", "stray", map[string]string{"app": "other"}, 9),
+	)
+	a := New(Config{
+		ProductID:  "prod",
+		Namespaces: []string{"default"},
+	}, NewClientsetLister(client), &stubReporter{}, nil)
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 service, got %d: %+v", len(got), got)
+	}
+	if got[0].RestartCount == nil {
+		t.Fatal("RestartCount should be set when the deployment has a selector")
+	}
+	if *got[0].RestartCount != 6 {
+		t.Errorf("RestartCount = %d, want 6 (3 + 1 + 2; stray pod with app=other excluded)", *got[0].RestartCount)
 	}
 }
 

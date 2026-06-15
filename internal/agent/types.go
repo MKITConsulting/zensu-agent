@@ -16,6 +16,7 @@ type ServiceHeartbeat struct {
 	Status          string `json:"status"`
 	ReadyReplicas   *int32 `json:"readyReplicas,omitempty"`
 	DesiredReplicas *int32 `json:"desiredReplicas,omitempty"`
+	RestartCount    *int32 `json:"restartCount,omitempty"`
 	IntervalSeconds int32  `json:"intervalSeconds,omitempty"`
 }
 

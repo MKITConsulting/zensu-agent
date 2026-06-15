@@ -22,13 +22,13 @@ type Config struct {
 // Agent collects annotated Deployment statuses and reports them to Zensu.
 type Agent struct {
 	cfg      Config
-	lister   DeploymentLister
+	lister   ClusterReader
 	reporter reporter
 	log      *slog.Logger
 }
 
 // New builds an Agent.
-func New(cfg Config, lister DeploymentLister, r reporter, log *slog.Logger) *Agent {
+func New(cfg Config, lister ClusterReader, r reporter, log *slog.Logger) *Agent {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -52,6 +52,14 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 			}
 			if a.cfg.Interval > 0 {
 				entry.IntervalSeconds = int32(a.cfg.Interval.Seconds())
+			}
+			if sel := deploymentSelector(d); sel != "" {
+				if pods, err := a.lister.ListPods(ctx, ns, sel); err != nil {
+					a.log.Warn("list pods for restartCount failed", "deployment", d.Name, "error", err)
+				} else {
+					rc := sumRestarts(pods)
+					entry.RestartCount = &rc
+				}
 			}
 			seen[entry.Slug] = true
 			out = append(out, entry)

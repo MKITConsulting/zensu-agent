@@ -16,18 +16,21 @@ a documented public contract — point anything at it (see [Contract](#contract)
 ## How it works
 
 1. You annotate the workloads you want tracked.
-2. The agent lists those Deployments (read-only) on an interval.
+2. The agent lists those Deployments (read-only) on an interval, and the Pods
+   behind each one to total their container restart counts.
 3. It POSTs each service's status to `${ZENSU_API_URL}/api/runtime/heartbeat`
    with an `X-API-Key`.
 
 Status is derived from replica counts: all ready → `up`, some ready →
-`degraded`, none ready → `down`.
+`degraded`, none ready → `down`. Each heartbeat also carries the service's
+summed container `restartCount`.
 
 ## Trust / security
 
 - **Least privilege.** The bundled RBAC grants only `get/list/watch` on
-  `deployments` and `pods`. The agent cannot create, update, patch, or delete
-  anything — see [`helm/zensu-agent/templates/rbac.yaml`](helm/zensu-agent/templates/rbac.yaml).
+  `deployments` and `pods` (Pods are read solely to total restart counts). The
+  agent cannot create, update, patch, or delete anything — see
+  [`helm/zensu-agent/templates/rbac.yaml`](helm/zensu-agent/templates/rbac.yaml).
 - **Outbound-only egress.** The single network call is the heartbeat POST to the
   `ZENSU_API_URL` you configure — no inbound ports, no other destinations. See
   [`internal/agent/reporter.go`](internal/agent/reporter.go).
@@ -71,12 +74,17 @@ Helm values mirror these under `zensu.*` / `agent.*` — see
 
 ### Deploy modes
 
+Both modes run **inside** the cluster and authenticate via the mounted
+ServiceAccount token (in-cluster config):
+
 - `agent.mode=deployment` (default): long-running ticker.
 - `agent.mode=cronjob`: one-shot per `agent.schedule` (runs the binary with
   `--once`).
 
-Not on Kubernetes? Run the binary with `--once` from any cron host — it works
-anywhere it can reach the Zensu API and a kubeconfig is available.
+Running off-cluster (the binary on a VM cron host talking to a remote cluster
+via a kubeconfig) is not supported yet, and a `--probe-url` mode for
+non-Kubernetes targets is planned. Until then, point your own producer at the
+heartbeat [contract](#contract).
 
 ## Contract
 
@@ -93,7 +101,8 @@ Content-Type: application/json
   "source": "k8s-agent",
   "services": [
     { "slug": "auth-api", "name": "Auth API", "status": "up",
-      "readyReplicas": 3, "desiredReplicas": 3, "intervalSeconds": 60 }
+      "readyReplicas": 3, "desiredReplicas": 3, "restartCount": 0,
+      "intervalSeconds": 60 }
   ]
 }
 ```
