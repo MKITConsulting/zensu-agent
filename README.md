@@ -18,18 +18,32 @@ a documented public contract — point anything at it (see [Contract](#contract)
 1. You annotate the workloads you want tracked.
 2. The agent lists those Deployments (read-only) on an interval, and the Pods
    behind each one to total their container restart counts.
-3. It POSTs each service's status to `${ZENSU_API_URL}/api/runtime/heartbeat`
+3. If [metrics-server](https://github.com/kubernetes-sigs/metrics-server) is
+   installed, it also reads current per-service **CPU** (millicores) and
+   **memory** (bytes) from the `metrics.k8s.io` API, summed across all
+   containers of all matching Pods.
+4. It POSTs each service's status to `${ZENSU_API_URL}/api/runtime/heartbeat`
    with an `X-API-Key`.
 
 Status is derived from replica counts: all ready → `up`, some ready →
 `degraded`, none ready → `down`. Each heartbeat also carries the service's
-summed container `restartCount`.
+summed container `restartCount` and, when available, a `metrics` array of
+typed `{key, value}` samples (`cpu_millicores`, `memory_bytes`).
+
+**Graceful degrade.** Reading CPU/memory is best-effort and entirely optional.
+On clusters without metrics-server (common for self-hosted installs), the
+`metrics.k8s.io` API is simply absent: the agent logs a single warning, omits
+the `metrics` array, and keeps sending heartbeats — status and `restartCount`
+are unaffected. A transient metrics-server error skips metrics for that one tick
+only; the heartbeat still goes out.
 
 ## Trust / security
 
 - **Least privilege.** The bundled RBAC grants only `get/list/watch` on
-  `deployments` and `pods` (Pods are read solely to total restart counts). The
-  agent cannot create, update, patch, or delete anything — see
+  `deployments` and `pods` (Pods are read solely to total restart counts) plus
+  `get/list` on `metrics.k8s.io` `pods` (read-only CPU/memory usage; harmless if
+  metrics-server is absent). The agent cannot create, update, patch, or delete
+  anything — see
   [`helm/zensu-agent/templates/rbac.yaml`](helm/zensu-agent/templates/rbac.yaml).
 - **Outbound-only egress.** The single network call is the heartbeat POST to the
   `ZENSU_API_URL` you configure — no inbound ports, no other destinations. See
@@ -102,7 +116,11 @@ Content-Type: application/json
   "services": [
     { "slug": "auth-api", "name": "Auth API", "status": "up",
       "readyReplicas": 3, "desiredReplicas": 3, "restartCount": 0,
-      "intervalSeconds": 60 }
+      "intervalSeconds": 60,
+      "metrics": [
+        { "key": "cpu_millicores", "value": 1234 },
+        { "key": "memory_bytes", "value": 530000000 }
+      ] }
   ]
 }
 ```
@@ -110,6 +128,12 @@ Content-Type: application/json
 `status` is one of `up`, `degraded`, `down`. Services are auto-registered by
 `productId` + `slug` on first heartbeat; omitting `name` preserves a previously
 stored name.
+
+`metrics` is optional and may be omitted entirely (e.g. no metrics-server). Each
+entry is a typed `{key, value}` sample where `value` is a JSON number; the
+backend recognizes `cpu_millicores` and `memory_bytes` today and silently skips
+any unknown key, so producers can add samples without coordinating a backend
+change.
 
 ## Build from source
 
