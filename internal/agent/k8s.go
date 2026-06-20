@@ -2,30 +2,52 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
+	metricsclient "k8s.io/metrics/pkg/client/clientset/versioned"
 )
 
 // AnnotationService is the annotation a workload must carry to be reported.
 // Opt-in by design: only annotated Deployments are observed.
 const AnnotationService = "zensu.dev/service"
 
+// ErrMetricsAPIUnavailable signals that the cluster has no metrics.k8s.io API
+// registered (no metrics-server installed). It is a normal, expected condition
+// on self-hosted clusters: the agent logs it once and keeps sending heartbeats
+// without per-service CPU/memory. Callers should treat it as "metrics not
+// available" rather than a failure of the tick.
+var ErrMetricsAPIUnavailable = errors.New("metrics.k8s.io API not available")
+
 // ClusterReader is the minimal read-only Kubernetes surface the agent needs:
-// list Deployments, and list the Pods behind a Deployment to sum restarts. The
-// agent only ever reads — it never mutates anything.
+// list Deployments, list the Pods behind a Deployment to sum restarts, and read
+// per-pod CPU/memory usage from metrics-server. The agent only ever reads — it
+// never mutates anything.
 type ClusterReader interface {
 	ListDeployments(ctx context.Context, namespace string) ([]appsv1.Deployment, error)
 	ListPods(ctx context.Context, namespace, selector string) ([]corev1.Pod, error)
+	// PodMetricsForSelector sums current CPU (millicores) and memory (bytes)
+	// across every container of every pod matching selector in namespace.
+	//
+	// available reports whether usable metrics were obtained. When the cluster
+	// has no metrics-server, the returned error is ErrMetricsAPIUnavailable and
+	// available is false; callers degrade gracefully (heartbeat without
+	// metrics) instead of failing. Transient errors are returned as-is with
+	// available false.
+	PodMetricsForSelector(ctx context.Context, namespace, selector string) (cpuMillicores, memBytes int64, available bool, err error)
 }
 
 type clientsetLister struct {
-	client kubernetes.Interface
+	client  kubernetes.Interface
+	metrics metricsclient.Interface
 }
 
 func (l clientsetLister) ListDeployments(ctx context.Context, namespace string) ([]appsv1.Deployment, error) {
@@ -44,13 +66,45 @@ func (l clientsetLister) ListPods(ctx context.Context, namespace, selector strin
 	return list.Items, nil
 }
 
-// NewClientsetLister wraps a Kubernetes clientset as a ClusterReader.
-func NewClientsetLister(client kubernetes.Interface) ClusterReader {
-	return clientsetLister{client: client}
+// PodMetricsForSelector reads PodMetrics from metrics-server for the matched
+// pods and totals CPU/memory across all their containers. A missing
+// metrics.k8s.io API (no metrics-server) is mapped to ErrMetricsAPIUnavailable
+// so the caller can degrade gracefully; any other error is returned verbatim.
+func (l clientsetLister) PodMetricsForSelector(ctx context.Context, namespace, selector string) (int64, int64, bool, error) {
+	if l.metrics == nil {
+		return 0, 0, false, ErrMetricsAPIUnavailable
+	}
+	list, err := l.metrics.MetricsV1beta1().PodMetricses(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		if isMetricsAPIMissing(err) {
+			return 0, 0, false, ErrMetricsAPIUnavailable
+		}
+		return 0, 0, false, err
+	}
+	cpu, mem := sumPodMetrics(list.Items)
+	return cpu, mem, true, nil
+}
+
+// isMetricsAPIMissing reports whether err indicates the metrics.k8s.io API
+// group/resource is not registered on the cluster (no metrics-server). The
+// aggregated API server surfaces this as a NotFound StatusError on
+// discovery/list. Transient conditions (server timeout, unavailable backend)
+// are intentionally NOT treated as missing — they bubble up as transient.
+func isMetricsAPIMissing(err error) bool {
+	return apierrors.IsNotFound(err)
+}
+
+// NewClientsetLister wraps Kubernetes + metrics clientsets as a ClusterReader.
+// The metrics client may be nil; PodMetricsForSelector then reports the metrics
+// API as unavailable (graceful degrade).
+func NewClientsetLister(client kubernetes.Interface, metrics metricsclient.Interface) ClusterReader {
+	return clientsetLister{client: client, metrics: metrics}
 }
 
 // NewInClusterLister builds a ClusterReader from in-cluster config (the
-// ServiceAccount token mounted into the pod).
+// ServiceAccount token mounted into the pod). It constructs both the core
+// Kubernetes client and the metrics-server client; if the cluster lacks
+// metrics-server, metric reads degrade gracefully at call time.
 func NewInClusterLister() (ClusterReader, error) {
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -60,7 +114,11 @@ func NewInClusterLister() (ClusterReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes client: %w", err)
 	}
-	return clientsetLister{client: client}, nil
+	metrics, err := metricsclient.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("metrics client: %w", err)
+	}
+	return clientsetLister{client: client, metrics: metrics}, nil
 }
 
 // MapDeployment converts a Deployment to a ServiceHeartbeat when it carries the
@@ -106,4 +164,18 @@ func sumRestarts(pods []corev1.Pod) int32 {
 		}
 	}
 	return total
+}
+
+// sumPodMetrics totals CPU (millicores) and memory (bytes) across every
+// container of every supplied PodMetrics. CPU uses MilliValue() (e.g. 250m ->
+// 250); memory uses Value() in bytes.
+func sumPodMetrics(items []metricsv1beta1.PodMetrics) (cpuMillicores, memBytes int64) {
+	for _, pm := range items {
+		for i := range pm.Containers {
+			usage := pm.Containers[i].Usage
+			cpuMillicores += usage.Cpu().MilliValue()
+			memBytes += usage.Memory().Value()
+		}
+	}
+	return cpuMillicores, memBytes
 }
