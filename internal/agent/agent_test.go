@@ -3,15 +3,19 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 )
 
 func i32(v int32) *int32 { return &v }
@@ -40,6 +44,54 @@ func pod(ns, name string, lbls map[string]string, restarts ...int32) *corev1.Pod
 		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Labels: lbls},
 		Status:     corev1.PodStatus{ContainerStatuses: cs},
 	}
+}
+
+// container builds one ContainerMetrics with the given CPU (millicores) and
+// memory (bytes), used to assemble fake PodMetrics in tests.
+func container(name string, cpuMilli, memBytes int64) metricsv1beta1.ContainerMetrics {
+	return metricsv1beta1.ContainerMetrics{
+		Name: name,
+		Usage: corev1.ResourceList{
+			corev1.ResourceCPU:    *resource.NewMilliQuantity(cpuMilli, resource.DecimalSI),
+			corev1.ResourceMemory: *resource.NewQuantity(memBytes, resource.BinarySI),
+		},
+	}
+}
+
+func podMetrics(ns, name string, containers ...metricsv1beta1.ContainerMetrics) metricsv1beta1.PodMetrics {
+	return metricsv1beta1.PodMetrics{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+		Containers: containers,
+	}
+}
+
+// fakeReader is a controllable ClusterReader: deployments/pods come from a fake
+// clientset, while PodMetricsForSelector returns scripted CPU/memory (or a
+// scripted error such as ErrMetricsAPIUnavailable) so metrics paths can be
+// exercised deterministically.
+type fakeReader struct {
+	inner       ClusterReader
+	metricsCPU  int64
+	metricsMem  int64
+	available   bool
+	metricsErr  error
+	metricsHits int
+}
+
+func (f *fakeReader) ListDeployments(ctx context.Context, ns string) ([]appsv1.Deployment, error) {
+	return f.inner.ListDeployments(ctx, ns)
+}
+
+func (f *fakeReader) ListPods(ctx context.Context, ns, sel string) ([]corev1.Pod, error) {
+	return f.inner.ListPods(ctx, ns, sel)
+}
+
+func (f *fakeReader) PodMetricsForSelector(_ context.Context, _, _ string) (int64, int64, bool, error) {
+	f.metricsHits++
+	if f.metricsErr != nil {
+		return 0, 0, false, f.metricsErr
+	}
+	return f.metricsCPU, f.metricsMem, f.available, nil
 }
 
 func TestDeriveStatus(t *testing.T) {
@@ -90,7 +142,7 @@ func TestCollect_DedupAcrossNamespaces(t *testing.T) {
 		ProductID:  "prod",
 		Namespaces: []string{"ns1", "ns2"},
 		Interval:   30 * time.Second,
-	}, NewClientsetLister(client), &stubReporter{}, nil)
+	}, NewClientsetLister(client, nil), &stubReporter{}, nil)
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -124,7 +176,7 @@ func TestCollect_SumsRestartCounts(t *testing.T) {
 	a := New(Config{
 		ProductID:  "prod",
 		Namespaces: []string{"default"},
-	}, NewClientsetLister(client), &stubReporter{}, nil)
+	}, NewClientsetLister(client, nil), &stubReporter{}, nil)
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -138,6 +190,204 @@ func TestCollect_SumsRestartCounts(t *testing.T) {
 	}
 	if *got[0].RestartCount != 6 {
 		t.Errorf("RestartCount = %d, want 6 (3 + 1 + 2; stray pod with app=other excluded)", *got[0].RestartCount)
+	}
+}
+
+// TestSumPodMetrics covers the raw summation across multiple containers and
+// multiple pods, independent of the agent wiring.
+func TestSumPodMetrics(t *testing.T) {
+	items := []metricsv1beta1.PodMetrics{
+		podMetrics("default", "api-1",
+			container("app", 100, 200_000_000),
+			container("sidecar", 50, 30_000_000),
+		),
+		podMetrics("default", "api-2",
+			container("app", 250, 300_000_000),
+		),
+	}
+	cpu, mem := sumPodMetrics(items)
+	if cpu != 400 {
+		t.Errorf("cpu = %d, want 400 (100 + 50 + 250)", cpu)
+	}
+	if mem != 530_000_000 {
+		t.Errorf("mem = %d, want 530000000 (200M + 30M + 300M)", mem)
+	}
+}
+
+// TestCollect_AttachesMetrics verifies CPU/memory are summed across multiple
+// containers and multiple pods, then attached as exactly two MetricSamples with
+// the correct keys and values.
+func TestCollect_AttachesMetrics(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
+	reader := &fakeReader{
+		inner:      NewClientsetLister(client, nil),
+		metricsCPU: 400,         // e.g. 100 + 50 + 250 across pods/containers
+		metricsMem: 530_000_000, // e.g. 200M + 30M + 300M
+		available:  true,
+	}
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 service, got %d: %+v", len(got), got)
+	}
+	if reader.metricsHits != 1 {
+		t.Errorf("PodMetricsForSelector called %d times, want 1", reader.metricsHits)
+	}
+	ms := got[0].Metrics
+	if len(ms) != 2 {
+		t.Fatalf("want exactly 2 metric samples, got %d: %+v", len(ms), ms)
+	}
+	byKey := map[string]float64{}
+	for _, m := range ms {
+		byKey[m.Key] = m.Value
+	}
+	if v, ok := byKey[MetricCPUMillicores]; !ok || v != 400 {
+		t.Errorf("%s = %v (present=%v), want 400", MetricCPUMillicores, v, ok)
+	}
+	if v, ok := byKey[MetricMemoryBytes]; !ok || v != 530_000_000 {
+		t.Errorf("%s = %v (present=%v), want 530000000", MetricMemoryBytes, v, ok)
+	}
+}
+
+// TestCollect_GracefulDegradeNoMetricsServer verifies that when metrics-server
+// is absent (sentinel error), the heartbeat is still produced with no Metrics
+// and Collect returns no error — the tick must not fail.
+func TestCollect_GracefulDegradeNoMetricsServer(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
+	reader := &fakeReader{
+		inner:      NewClientsetLister(client, nil),
+		metricsErr: ErrMetricsAPIUnavailable,
+	}
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect must not error on missing metrics-server: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 service, got %d: %+v", len(got), got)
+	}
+	if len(got[0].Metrics) != 0 {
+		t.Errorf("Metrics must be empty when metrics-server is unavailable, got %+v", got[0].Metrics)
+	}
+	// Status/restart path still works.
+	if got[0].Status != StatusUp {
+		t.Errorf("status = %s, want up", got[0].Status)
+	}
+}
+
+// TestTick_GracefulDegradeNoMetricsServer is the Tick-level counterpart: a
+// heartbeat is still sent (no error) when metrics-server is missing.
+func TestTick_GracefulDegradeNoMetricsServer(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
+	reader := &fakeReader{
+		inner:      NewClientsetLister(client, nil),
+		metricsErr: ErrMetricsAPIUnavailable,
+	}
+	rep := &stubReporter{}
+	a := New(Config{ProductID: "prod", Source: "test", Namespaces: []string{"default"}}, reader, rep, nil)
+
+	if err := a.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick must not fail when metrics-server is missing: %v", err)
+	}
+	if rep.calls != 1 {
+		t.Fatalf("heartbeat should still be sent once, got %d calls", rep.calls)
+	}
+	if len(rep.last.Services) != 1 || len(rep.last.Services[0].Metrics) != 0 {
+		t.Errorf("sent batch should carry the service without metrics: %+v", rep.last.Services)
+	}
+}
+
+// TestCollect_GracefulDegradeTransientError verifies a transient (non-sentinel)
+// metrics error does not crash the tick and yields no metrics for that tick.
+func TestCollect_GracefulDegradeTransientError(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
+	reader := &fakeReader{
+		inner:      NewClientsetLister(client, nil),
+		metricsErr: errors.New("metrics-server temporarily unavailable"),
+	}
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect must not error on transient metrics error: %v", err)
+	}
+	if len(got) != 1 || len(got[0].Metrics) != 0 {
+		t.Errorf("transient metrics error should yield no metrics: %+v", got)
+	}
+}
+
+// TestMetricsJSONMarshal verifies a batch carrying metrics marshals to the
+// agreed contract shape: metrics is an array of {key,value} objects (camelCase).
+func TestMetricsJSONMarshal(t *testing.T) {
+	batch := HeartbeatBatch{
+		ProductID: "p",
+		Services: []ServiceHeartbeat{{
+			Slug:   "api",
+			Status: StatusUp,
+			Metrics: []MetricSample{
+				{Key: MetricCPUMillicores, Value: 1234},
+				{Key: MetricMemoryBytes, Value: 530000000},
+			},
+		}},
+	}
+	b, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{
+		`"metrics":[`,
+		`"key":"cpu_millicores"`,
+		`"value":1234`,
+		`"key":"memory_bytes"`,
+		`"value":530000000`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("marshalled batch missing %q\n got: %s", want, s)
+		}
+	}
+
+	// Round-trip back to confirm exact values survive.
+	var rt HeartbeatBatch
+	if err := json.Unmarshal(b, &rt); err != nil {
+		t.Fatal(err)
+	}
+	rms := rt.Services[0].Metrics
+	if len(rms) != 2 || rms[0].Key != MetricCPUMillicores || rms[0].Value != 1234 ||
+		rms[1].Key != MetricMemoryBytes || rms[1].Value != 530000000 {
+		t.Errorf("round-tripped metrics wrong: %+v", rms)
+	}
+}
+
+// TestServiceHeartbeat_OmitsEmptyMetrics confirms the metrics field is omitted
+// entirely (omitempty) when no samples are present — so degraded heartbeats
+// don't carry an empty "metrics" key.
+func TestServiceHeartbeat_OmitsEmptyMetrics(t *testing.T) {
+	b, err := json.Marshal(ServiceHeartbeat{Slug: "api", Status: StatusUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "metrics") {
+		t.Errorf("empty metrics must be omitted, got: %s", b)
+	}
+}
+
+// TestPodMetricsForSelector_NilMetricsClient verifies the real lister reports
+// the metrics API as unavailable (graceful sentinel) when constructed without a
+// metrics client.
+func TestPodMetricsForSelector_NilMetricsClient(t *testing.T) {
+	r := NewClientsetLister(fake.NewSimpleClientset(), nil)
+	cpu, mem, available, err := r.PodMetricsForSelector(context.Background(), "default", "app=api")
+	if !errors.Is(err, ErrMetricsAPIUnavailable) {
+		t.Errorf("err = %v, want ErrMetricsAPIUnavailable", err)
+	}
+	if available || cpu != 0 || mem != 0 {
+		t.Errorf("expected unavailable zero metrics, got cpu=%d mem=%d available=%v", cpu, mem, available)
 	}
 }
 
@@ -161,7 +411,7 @@ func TestTick_SendsBatch(t *testing.T) {
 		Source:     "test",
 		Namespaces: []string{"default"},
 		Interval:   60 * time.Second,
-	}, NewClientsetLister(client), rep, nil)
+	}, NewClientsetLister(client, nil), rep, nil)
 
 	if err := a.Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -176,7 +426,7 @@ func TestTick_SendsBatch(t *testing.T) {
 
 func TestTick_NoWorkloadsSkipsSend(t *testing.T) {
 	rep := &stubReporter{}
-	a := New(Config{Namespaces: []string{"default"}}, NewClientsetLister(fake.NewSimpleClientset()), rep, nil)
+	a := New(Config{Namespaces: []string{"default"}}, NewClientsetLister(fake.NewSimpleClientset(), nil), rep, nil)
 	if err := a.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +438,7 @@ func TestTick_NoWorkloadsSkipsSend(t *testing.T) {
 func TestRun_Once(t *testing.T) {
 	client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
 	rep := &stubReporter{}
-	a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: time.Second}, NewClientsetLister(client), rep, nil)
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: time.Second}, NewClientsetLister(client, nil), rep, nil)
 	if err := a.Run(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}

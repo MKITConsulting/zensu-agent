@@ -2,7 +2,9 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,6 +27,11 @@ type Agent struct {
 	lister   ClusterReader
 	reporter reporter
 	log      *slog.Logger
+
+	// metricsAPIWarned latches once metrics-server is found to be absent, so the
+	// "no metrics-server" warning is logged a single time over the agent's
+	// lifetime instead of once per service per tick.
+	metricsAPIWarned atomic.Bool
 }
 
 // New builds an Agent.
@@ -60,12 +67,40 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 					rc := sumRestarts(pods)
 					entry.RestartCount = &rc
 				}
+				a.attachMetrics(ctx, ns, sel, &entry)
 			}
 			seen[entry.Slug] = true
 			out = append(out, entry)
 		}
 	}
 	return out, nil
+}
+
+// attachMetrics reads CPU/memory from metrics-server for the given
+// namespace+selector and appends them to entry. It NEVER fails the tick:
+//   - missing metrics.k8s.io API (no metrics-server): log one Warn over the
+//     agent's lifetime and continue without metrics (graceful degrade);
+//   - any other (transient) error: log a Warn and skip metrics for this tick;
+//   - success: append cpu_millicores and memory_bytes samples.
+func (a *Agent) attachMetrics(ctx context.Context, namespace, selector string, entry *ServiceHeartbeat) {
+	cpu, mem, available, err := a.lister.PodMetricsForSelector(ctx, namespace, selector)
+	if err != nil {
+		if errors.Is(err, ErrMetricsAPIUnavailable) {
+			if a.metricsAPIWarned.CompareAndSwap(false, true) {
+				a.log.Warn("metrics-server (metrics.k8s.io) not available; sending heartbeats without CPU/memory metrics")
+			}
+			return
+		}
+		a.log.Warn("read pod metrics failed; skipping metrics this tick", "service", entry.Slug, "error", err)
+		return
+	}
+	if !available {
+		return
+	}
+	entry.Metrics = append(entry.Metrics,
+		MetricSample{Key: MetricCPUMillicores, Value: float64(cpu)},
+		MetricSample{Key: MetricMemoryBytes, Value: float64(mem)},
+	)
 }
 
 // Tick collects and reports a single heartbeat batch.
