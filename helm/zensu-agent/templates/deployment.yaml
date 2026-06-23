@@ -12,6 +12,12 @@ spec:
       {{- include "zensu-agent.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- if and .Values.metrics.enabled .Values.metrics.podAnnotations }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /metrics
+      {{- end }}
       labels:
         {{- include "zensu-agent.selectorLabels" . | nindent 8 }}
     spec:
@@ -24,11 +30,34 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          {{- end }}
           envFrom:
             - configMapRef:
                 name: {{ include "zensu-agent.fullname" . }}
             - secretRef:
                 name: {{ include "zensu-agent.secretName" . }}
+          {{- if .Values.metrics.enabled }}
+          env:
+            - name: ZENSU_AGENT_METRICS_ENABLED
+              value: "true"
+            - name: ZENSU_AGENT_METRICS_ADDR
+              value: ":{{ .Values.metrics.port }}"
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          {{- else }}
+          env:
+            - name: ZENSU_AGENT_METRICS_ENABLED
+              value: "false"
+          {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       {{- with .Values.nodeSelector }}

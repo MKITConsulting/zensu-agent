@@ -8,15 +8,19 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
 )
 
 // Reporter posts heartbeat batches to the Zensu API over outbound HTTPS. It is
-// the only component that talks to the network, and it only ever POSTs
-// heartbeats to the single configured URL.
+// the only component that makes outbound network calls, and it only ever POSTs
+// heartbeats to the single configured URL. (The optional metrics endpoint is a
+// separate inbound listener owned by the metrics package.)
 type Reporter struct {
 	BaseURL string
 	APIKey  string
 	Client  *http.Client
+	Metrics *obs.Metrics
 }
 
 // NewReporter builds a Reporter with the given request timeout.
@@ -29,7 +33,10 @@ func NewReporter(baseURL, apiKey string, timeout time.Duration) *Reporter {
 }
 
 // Send POSTs a heartbeat batch to /api/runtime/heartbeat.
-func (r *Reporter) Send(ctx context.Context, batch HeartbeatBatch) error {
+func (r *Reporter) Send(ctx context.Context, batch HeartbeatBatch) (err error) {
+	start := time.Now()
+	defer func() { r.Metrics.RecordHeartbeat(err == nil, time.Since(start)) }()
+
 	body, err := json.Marshal(batch)
 	if err != nil {
 		return err

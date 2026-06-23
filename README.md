@@ -80,8 +80,12 @@ metadata:
 | `ZENSU_AGENT_INTERVAL` | no | `60s` | Heartbeat cadence (Go duration) |
 | `ZENSU_AGENT_NAMESPACES` | no | `default` | Comma-separated namespaces to scan |
 | `ZENSU_AGENT_SOURCE` | no | `k8s-agent` | Source label attached to heartbeats |
+| `ZENSU_AGENT_METRICS_ENABLED` | no | `true` | Serve the Prometheus `/metrics` endpoint (deployment mode only) |
+| `ZENSU_AGENT_METRICS_ADDR` | no | `:2112` | Listen address for the `/metrics` endpoint |
 
-Helm values mirror these under `zensu.*` / `agent.*` — see
+Helm values mirror these under `zensu.*` / `agent.*`, and the metrics toggles
+live under `metrics.*` (the metrics env vars are wired into the Deployment
+automatically when `metrics.enabled=true`) — see
 [`values.yaml`](helm/zensu-agent/values.yaml). Supply the API key out-of-band with
 `zensu.existingSecret` (a Secret holding key `ZENSU_API_KEY`) instead of
 `zensu.apiKey`.
@@ -99,6 +103,63 @@ Running off-cluster (the binary on a VM cron host talking to a remote cluster
 via a kubeconfig) is not supported yet, and a `--probe-url` mode for
 non-Kubernetes targets is planned. Until then, point your own producer at the
 heartbeat [contract](#contract).
+
+## Metrics
+
+In **deployment** mode the agent serves a Prometheus `/metrics` endpoint (default
+`:2112`) so you can monitor the agent itself. It is opt-in via Helm and runs only
+in deployment mode — a `cronjob` pod is one-shot and exits before a scrape, so no
+endpoint is served there.
+
+Exposed series (plus the standard `go_*` / `process_*` collectors):
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `zensu_agent_heartbeat_total{result="success\|error"}` | counter | Heartbeat POSTs by outcome |
+| `zensu_agent_last_success_timestamp_seconds` | gauge | Unix time of the last successful POST (alert on staleness) |
+| `zensu_agent_post_duration_seconds` | histogram | Heartbeat POST latency |
+| `zensu_agent_services_reported` | gauge | Services in the last successful batch |
+
+Enable scraping one of two ways:
+
+```bash
+# Prometheus Operator (kube-prometheus-stack): create a ServiceMonitor
+helm upgrade ... \
+  --set metrics.serviceMonitor.enabled=true \
+  --set metrics.serviceMonitor.interval=30s
+# match your stack's discovery label, e.g.:
+#   --set metrics.serviceMonitor.additionalLabels.release=kube-prometheus-stack
+
+# Non-operator Prometheus: add prometheus.io scrape annotations to the pod
+helm upgrade ... --set metrics.podAnnotations=true
+```
+
+Disable entirely with `--set metrics.enabled=false`. A useful staleness alert is
+`time() - zensu_agent_last_success_timestamp_seconds > 300` (no successful
+heartbeat in 5 minutes). Note that the deployment's readiness probe targets
+`/metrics`, so `metrics.enabled=false` leaves the agent with no readiness probe
+(it has no other health surface).
+
+`/metrics` is unauthenticated (standard for Prometheus) and binds all interfaces,
+exposing only counters/gauges/histograms — no API key, product ID, or heartbeat
+payloads. To restrict which pods may scrape it, enable the opt-in NetworkPolicy
+and set `metrics.networkPolicy.from` to standard NetworkPolicy peers:
+
+```yaml
+metrics:
+  networkPolicy:
+    enabled: true
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+```
+
+Two cautions: with an empty `from` the policy restricts only the port (not the
+source), so set `from` to actually scope who may scrape. And since the readiness
+probe is a kubelet-issued HTTP check (originating from the node, not a pod), a
+`from` that excludes the node can flap the pod to NotReady — allow the node/kubelet
+source when you restrict ingress.
 
 ## Contract
 

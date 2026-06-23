@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
 )
 
 // reporter is the subset of *Reporter the Agent depends on (eases testing).
@@ -27,6 +29,7 @@ type Agent struct {
 	lister   ClusterReader
 	reporter reporter
 	log      *slog.Logger
+	Metrics  *obs.Metrics
 
 	// metricsAPIWarned latches once metrics-server is found to be absent, so the
 	// "no metrics-server" warning is logged a single time over the agent's
@@ -110,6 +113,7 @@ func (a *Agent) Tick(ctx context.Context) error {
 		return err
 	}
 	if len(services) == 0 {
+		a.Metrics.SetServicesReported(0)
 		a.log.Info("no annotated workloads found", "annotation", AnnotationService)
 		return nil
 	}
@@ -117,6 +121,7 @@ func (a *Agent) Tick(ctx context.Context) error {
 	if err := a.reporter.Send(ctx, batch); err != nil {
 		return err
 	}
+	a.Metrics.SetServicesReported(len(services))
 	a.log.Info("heartbeat sent", "services", len(services))
 	return nil
 }

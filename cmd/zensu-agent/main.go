@@ -3,8 +3,9 @@
 //
 // It reads (never mutates) Deployments carrying the `zensu.dev/service`
 // annotation and POSTs their up/degraded/down status to
-// ${ZENSU_API_URL}/api/runtime/heartbeat with an X-API-Key. All traffic is
-// outbound; the agent never exposes a server.
+// ${ZENSU_API_URL}/api/runtime/heartbeat with an X-API-Key. All heartbeat
+// traffic is outbound; in long-running deployment mode it may additionally
+// expose a local Prometheus /metrics endpoint for scraping (opt-in).
 package main
 
 import (
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/MKITConsulting/zensu-agent/internal/agent"
+	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
 )
 
 func main() {
@@ -52,6 +54,19 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if envBool("ZENSU_AGENT_METRICS_ENABLED", true) && !*once {
+		m := obs.New()
+		reporter.Metrics = m
+		a.Metrics = m
+		addr := envOr("ZENSU_AGENT_METRICS_ADDR", obs.DefaultAddr)
+		log.Info("metrics endpoint enabled", "addr", addr, "path", "/metrics")
+		go func() {
+			if err := m.Serve(ctx, addr); err != nil && ctx.Err() == nil {
+				log.Error("metrics server stopped", "error", err)
+			}
+		}()
+	}
+
 	if err := a.Run(ctx, *once); err != nil && ctx.Err() == nil {
 		log.Error("agent stopped", "error", err)
 		os.Exit(1)
@@ -63,6 +78,17 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envBool(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "":
+		return def
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func envDuration(key string, def time.Duration) time.Duration {
