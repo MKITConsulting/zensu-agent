@@ -25,6 +25,18 @@ agent:
   # cronjob mode only
   schedule: "*/1 * * * *"
 
+metrics:
+  enabled: true
+  port: 2112
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    additionalLabels: {}
+  podAnnotations: false
+  networkPolicy:
+    enabled: false
+    from: []
+
 rbac:
   # Create the read-only ClusterRole + binding: get/list/watch deployments and
   # pods, plus get/list on metrics.k8s.io pods (per-service CPU/memory; optional —
